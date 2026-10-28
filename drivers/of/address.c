@@ -444,7 +444,7 @@ static int of_translate_one(struct device_node *parent, struct of_bus *bus,
 {
 	const __be32 *ranges;
 	unsigned int rlen;
-	int rone;
+	int rone, flag_cells;
 	u64 offset = OF_BAD_ADDR;
 
 	/*
@@ -474,7 +474,9 @@ static int of_translate_one(struct device_node *parent, struct of_bus *bus,
 	}
 	if (ranges == NULL || rlen == 0) {
 		offset = of_read_number(addr, na);
-		memset(addr, 0, pna * 4);
+		/* set address to zero, pass flags through */
+		flag_cells = pbus->has_flags ? 1 : 0;
+		memset(addr + flag_cells, 0, (pna - flag_cells) * 4);
 		pr_debug("empty ranges; 1:1 translation\n");
 		goto finish;
 	}
