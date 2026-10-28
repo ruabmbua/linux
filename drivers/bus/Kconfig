@@ -240,6 +240,19 @@ config DA8XX_MSTPRI
 	  configuration. Allows to adjust the priorities of all master
 	  peripherals.
 
+config FPGA_PCI_BUS
+	tristate "Bus driver for IP cores in a PCIe-attached FPGA"
+	depends on PCI && OF_IRQ
+	help
+	  Instantiates the IP cores of a PCIe-attached FPGA as platform
+	  devices, as described by the children of the endpoint's device
+	  tree node, and exposes the FPGA interrupt splitter as an interrupt
+	  controller. This allows using the regular platform drivers of
+	  those IP cores.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called fpga-pci-bus.
+
 source "drivers/bus/fsl-mc/Kconfig"
 source "drivers/bus/mhi/Kconfig"
 

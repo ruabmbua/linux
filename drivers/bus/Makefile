@@ -37,5 +37,7 @@ obj-$(CONFIG_VEXPRESS_CONFIG)	+= vexpress-config.o
 
 obj-$(CONFIG_DA8XX_MSTPRI)	+= da8xx-mstpri.o
 
+obj-$(CONFIG_FPGA_PCI_BUS)	+= fpga-pci-bus.o
+
 # MHI
 obj-y				+= mhi/
