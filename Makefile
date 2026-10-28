@@ -7,7 +7,7 @@ NAME = Dare mighty things
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
-# More info can be located in ./README
+# More info can be located in ./README.md
 # Comments in this file are targeted only to the developer, do not
 # expect to learn how to build the kernel reading this file.
 
@@ -1683,7 +1683,7 @@ help:
 	@echo  '		Multiple levels can be combined with W=12 or W=123'
 	@echo  ''
 	@echo  'Execute "make" or "make all" to build all targets marked with [*] '
-	@echo  'For further info see the ./README file'
+	@echo  'For further info see the ./README.md file'
 
 
 help-board-dirs := $(addprefix help-,$(board-dirs))
