@@ -1,0 +1,137 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/bus/fpga-pci-bus.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: IP cores inside a PCIe-attached FPGA
+
+maintainers:
+  - TODO Maintainer Name <roland@rucky.eu>
+
+description: |
+  An FPGA connected as a PCIe endpoint that contains IP cores with regular
+  platform device drivers. The IP cores are described as children of the
+  endpoint's node, which is placed below the PCIe host bridge or root port
+  node as usual for PCI devices.
+
+  The children's "reg" entries are relative to the BARs of the endpoint:
+  <bar offset size>. Every entry selects its BAR individually, so one IP
+  core may have regions in different BARs.
+
+  The operating system adds a "ranges" property mapping <bar 0> to the PCI
+  bus address of each memory BAR once the BARs are assigned, so that child
+  addresses translate to CPU addresses through the usual means. The device
+  tree must not contain one, and the bridges between the endpoint and the
+  host bridge must translate PCI addresses (e.g. an empty "ranges").
+
+  The PCIe interrupt is demultiplexed by an interrupt splitter in the FPGA,
+  which is exposed as an interrupt controller on the endpoint node. The
+  interrupt specifier is the splitter input number and the trigger type,
+  one of IRQ_TYPE_LEVEL_HIGH, IRQ_TYPE_LEVEL_LOW, IRQ_TYPE_EDGE_RISING or
+  IRQ_TYPE_EDGE_FALLING; the splitter is configured accordingly.
+
+  Children and the endpoint itself honour status = "disabled".
+
+properties:
+  compatible:
+    description: PCI vendor and device ID of the FPGA design
+    items:
+      - const: pci1172,e001
+
+  reg:
+    maxItems: 1
+
+  "#address-cells":
+    description: child address <bar offset>
+    const: 2
+
+  "#size-cells":
+    const: 1
+
+  ranges: false
+
+  interrupt-controller: true
+
+  "#interrupt-cells":
+    const: 2
+
+patternProperties:
+  "@[0-5],[0-9a-f]+$":
+    type: object
+    description: IP core, bound to its regular platform driver
+
+required:
+  - compatible
+  - reg
+  - "#address-cells"
+  - "#size-cells"
+
+dependencies:
+  interrupt-controller: ["#interrupt-cells"]
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    fpga_clk: clock {
+        compatible = "fixed-clock";
+        #clock-cells = <0>;
+        clock-frequency = <125000000>;
+    };
+
+    pcie {
+        #address-cells = <3>;
+        #size-cells = <2>;
+
+        /* Root port */
+        pcie@0,0 {
+            device_type = "pci";
+            reg = <0x0000 0 0 0 0>;
+            bus-range = <1 1>;
+            #address-cells = <3>;
+            #size-cells = <2>;
+            ranges;
+
+            fpga@0,0 {
+                compatible = "pci1172,e001";
+                reg = <0x10000 0 0 0 0>;
+                #address-cells = <2>;
+                #size-cells = <1>;
+                interrupt-controller;
+                #interrupt-cells = <2>;
+
+                i2c@0,100 {
+                    compatible = "altr,softip-i2c-v1.0";
+                    reg = <0 0x100 0x40>;
+                    interrupts = <0 IRQ_TYPE_LEVEL_HIGH>;
+                    clocks = <&fpga_clk>;
+                    clock-frequency = <100000>;
+                    fifo-size = <4>;
+                    #address-cells = <1>;
+                    #size-cells = <0>;
+                };
+
+                dma@0,200 {
+                    compatible = "altr,socfpga-msgdma";
+                    reg = <0 0x200 0x20>,
+                          <2 0x0 0x20>,
+                          <2 0x20 0x10>;
+                    reg-names = "csr", "desc", "resp";
+                    interrupts = <1 IRQ_TYPE_LEVEL_HIGH>;
+                    #dma-cells = <1>;
+                    dma-channels = <1>;
+                    dma-requests = <1>;
+                };
+
+                spi@1,0 {
+                    compatible = "altr,spi-1.0";
+                    reg = <1 0x0 0x20>;
+                    interrupts = <2 IRQ_TYPE_LEVEL_HIGH>;
+                    status = "disabled";
+                };
+            };
+        };
+    };
