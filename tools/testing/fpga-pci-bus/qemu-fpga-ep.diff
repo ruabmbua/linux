@@ -1,0 +1,403 @@
+--- a/hw/misc/Kconfig
++++ b/hw/misc/Kconfig
+@@ -30,6 +30,14 @@
+     default y if TEST_DEVICES
+     depends on PCI && MSI_NONBROKEN
+ 
++config FPGA_EP
++    bool
++    default y if TEST_DEVICES
++    depends on PCI && MSI_NONBROKEN
++    select CADENCE
++    select XILINX
++    select SERIAL
++
+ config PCA9552
+     bool
+     depends on I2C
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -1,5 +1,6 @@
+ system_ss.add(when: 'CONFIG_APPLESMC', if_true: files('applesmc.c'))
+ system_ss.add(when: 'CONFIG_EDU', if_true: files('edu.c'))
++system_ss.add(when: 'CONFIG_FPGA_EP', if_true: files('fpga_ep.c'))
+ system_ss.add(when: 'CONFIG_FW_CFG_DMA', if_true: files('vmcoreinfo.c'))
+ system_ss.add(when: 'CONFIG_ISA_DEBUG', if_true: files('debugexit.c'))
+ system_ss.add(when: 'CONFIG_ISA_TESTDEV', if_true: files('pc-testdev.c'))
+--- a/hw/char/xilinx_uartlite.c
++++ b/hw/char/xilinx_uartlite.c
+@@ -68,15 +68,16 @@
+     uint32_t regs[R_MAX];
+ };
+ 
+-static void uart_update_irq(XilinxUARTLite *s)
++/*
++ * Like the hardware, signal an interrupt with a pulse when the RX FIFO
++ * becomes non-empty or the TX FIFO becomes empty, rather than with a
++ * level that never drops while interrupts are enabled.
++ */
++static void uart_pulse_irq(XilinxUARTLite *s)
+ {
+-    unsigned int irq;
+-
+-    if (s->rx_fifo_len)
+-        s->regs[R_STATUS] |= STATUS_IE;
+-
+-    irq = (s->regs[R_STATUS] & STATUS_IE) && (s->regs[R_CTRL] & CONTROL_IE);
+-    qemu_set_irq(s->irq, irq);
++    if (s->regs[R_CTRL] & CONTROL_IE) {
++        qemu_irq_pulse(s->irq);
++    }
+ }
+ 
+ static void uart_update_status(XilinxUARTLite *s)
+@@ -84,7 +85,8 @@
+     uint32_t r;
+ 
+     r = s->regs[R_STATUS];
+-    r &= ~7;
++    r &= ~(7 | STATUS_IE);
++    r |= s->regs[R_CTRL] & CONTROL_IE ? STATUS_IE : 0;
+     r |= 1 << 2; /* Tx fifo is always empty. We are fast :) */
+     r |= (s->rx_fifo_len == sizeof (s->rx_fifo)) << 1;
+     r |= (!!s->rx_fifo_len);
+@@ -109,7 +111,6 @@
+             if (s->rx_fifo_len)
+                 s->rx_fifo_len--;
+             uart_update_status(s);
+-            uart_update_irq(s);
+             qemu_chr_fe_accept_input(&s->chr);
+             break;
+ 
+@@ -152,8 +153,8 @@
+             qemu_chr_fe_write_all(&s->chr, &ch, 1);
+             s->regs[addr] = value;
+ 
+-            /* hax.  */
+-            s->regs[R_STATUS] |= STATUS_IE;
++            uart_update_status(s);
++            uart_pulse_irq(s);
+             break;
+ 
+         default:
+@@ -163,7 +164,6 @@
+             break;
+     }
+     uart_update_status(s);
+-    uart_update_irq(s);
+ }
+ 
+ static const MemoryRegionOps uart_ops = {
+@@ -196,7 +196,9 @@
+     s->rx_fifo_len++;
+ 
+     uart_update_status(s);
+-    uart_update_irq(s);
++    if (s->rx_fifo_len == 1) {
++        uart_pulse_irq(s);
++    }
+ }
+ 
+ static int uart_can_rx(void *opaque)
+--- /dev/null
++++ b/hw/misc/fpga_ep.c
+@@ -0,0 +1,299 @@
++/*
++ * Model of a PCIe-attached FPGA carrying soft IP cores, for testing
++ * the Linux fpga-pci-bus driver.
++ *
++ * BAR0 0x0000  interrupt splitter
++ *              0x0 STATUS  RO   latched pending flags
++ *              0x4 ENABLE  RW   1 = forwarded to the PCIe interrupt
++ *              0x8 CLEAR   WO   write 1 to clear
++ *              0xc TYPE    RW   1 = edge: latch on the active edge,
++ *                               0 = level: re-latch while active
++ *              0x10 POLARITY RW 1 = active low / falling edge
++ * BAR0 0x1000  Xilinx uartlite            -> splitter input 0
++ * BAR0 0x2000  16550 UART (serial-mm)     -> splitter input 2
++ * BAR2 0x0000  Cadence GEM, DMA via PCIe   -> splitter input 1
++ *
++ * An MSI is sent on every transition of (STATUS & ENABLE) from zero to
++ * non-zero; with INTx the line is asserted while it is non-zero.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "hw/pci/pci_device.h"
++#include "hw/pci/msi.h"
++#include "hw/qdev-properties.h"
++#include "hw/qdev-properties-system.h"
++#include "hw/sysbus.h"
++#include "hw/irq.h"
++#include "hw/char/xilinx_uartlite.h"
++#include "hw/char/serial.h"
++#include "hw/net/cadence_gem.h"
++#include "chardev/char.h"
++#include "qom/object.h"
++
++#define TYPE_FPGA_EP "fpga-ep"
++OBJECT_DECLARE_SIMPLE_TYPE(FpgaEpState, FPGA_EP)
++
++#define REG_STATUS	0x0
++#define REG_ENABLE	0x4
++#define REG_CLEAR	0x8
++#define REG_TYPE	0xc
++#define REG_POLARITY	0x10
++
++struct FpgaEpState {
++    PCIDevice parent_obj;
++
++    MemoryRegion bar0;
++    MemoryRegion bar2;
++    MemoryRegion splitter;
++
++    uint32_t level;		/* raw input lines */
++    uint32_t type;
++    uint32_t polarity;
++    uint32_t status;
++    uint32_t enable;
++    bool asserted;
++
++    char *chardev;
++    char *serial;
++    char *netdev;
++};
++
++static void fpga_ep_update(FpgaEpState *s)
++{
++    PCIDevice *pdev = PCI_DEVICE(s);
++    bool pending = s->status & s->enable;
++
++    if (msi_enabled(pdev)) {
++        if (pending && !s->asserted) {
++            msi_notify(pdev, 0);
++        }
++    } else {
++        pci_set_irq(pdev, pending);
++    }
++    s->asserted = pending;
++}
++
++static uint32_t fpga_ep_active(FpgaEpState *s)
++{
++    return s->level ^ s->polarity;
++}
++
++/* Latch level inputs while active, edge inputs on an inactive->active edge */
++static void fpga_ep_latch(FpgaEpState *s, uint32_t old_active)
++{
++    uint32_t active = fpga_ep_active(s);
++
++    s->status |= (active & ~s->type) | (active & ~old_active & s->type);
++}
++
++static void fpga_ep_set_irq(void *opaque, int n, int level)
++{
++    FpgaEpState *s = opaque;
++
++    uint32_t old = fpga_ep_active(s);
++
++    if (level) {
++        s->level |= BIT(n);
++    } else {
++        s->level &= ~BIT(n);
++    }
++    fpga_ep_latch(s, old);
++    fpga_ep_update(s);
++}
++
++static uint64_t fpga_ep_splitter_read(void *opaque, hwaddr addr,
++                                      unsigned size)
++{
++    FpgaEpState *s = opaque;
++
++    switch (addr) {
++    case REG_STATUS:
++        return s->status;
++    case REG_ENABLE:
++        return s->enable;
++    case REG_TYPE:
++        return s->type;
++    case REG_POLARITY:
++        return s->polarity;
++    default:
++        return 0;
++    }
++}
++
++static void fpga_ep_splitter_write(void *opaque, hwaddr addr, uint64_t val,
++                                   unsigned size)
++{
++    FpgaEpState *s = opaque;
++    uint32_t old = fpga_ep_active(s);
++
++    switch (addr) {
++    case REG_ENABLE:
++        s->enable = val;
++        break;
++    case REG_CLEAR:
++        s->status &= ~val;
++        fpga_ep_latch(s, fpga_ep_active(s));
++        break;
++    case REG_TYPE:
++        s->type = val;
++        fpga_ep_latch(s, fpga_ep_active(s));
++        break;
++    case REG_POLARITY:
++        s->polarity = val;
++        fpga_ep_latch(s, old);
++        break;
++    default:
++        return;
++    }
++    fpga_ep_update(s);
++}
++
++static const MemoryRegionOps fpga_ep_splitter_ops = {
++    .read = fpga_ep_splitter_read,
++    .write = fpga_ep_splitter_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++    .impl = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++};
++
++static void fpga_ep_realize(PCIDevice *pdev, Error **errp)
++{
++    FpgaEpState *s = FPGA_EP(pdev);
++    DeviceState *dev;
++    SysBusDevice *sbd;
++
++    pci_config_set_interrupt_pin(pdev->config, 1);
++    if (msi_init(pdev, 0, 1, true, false, errp)) {
++        return;
++    }
++
++    qdev_init_gpio_in(DEVICE(s), fpga_ep_set_irq, 32);
++
++    memory_region_init(&s->bar0, OBJECT(s), "fpga-ep-bar0", 0x10000);
++    memory_region_init(&s->bar2, OBJECT(s), "fpga-ep-bar2", 0x10000);
++    memory_region_init_io(&s->splitter, OBJECT(s), &fpga_ep_splitter_ops, s,
++                          "fpga-ep-splitter", 0x14);
++    memory_region_add_subregion(&s->bar0, 0x0, &s->splitter);
++
++    /*
++     * The IP cores are not QOM children of the PCI device: the machine
++     * would take them for user created sysbus devices and refuse them.
++     */
++
++    /* uartlite */
++    dev = qdev_new(TYPE_XILINX_UARTLITE);
++    if (s->chardev) {
++        Chardev *chr = qemu_chr_find(s->chardev);
++
++        if (!chr) {
++            error_setg(errp, "chardev '%s' not found", s->chardev);
++            return;
++        }
++        qdev_prop_set_chr(dev, "chardev", chr);
++    }
++    sbd = SYS_BUS_DEVICE(dev);
++    if (!sysbus_realize_and_unref(sbd, errp)) {
++        return;
++    }
++    memory_region_add_subregion(&s->bar0, 0x1000,
++                                sysbus_mmio_get_region(sbd, 0));
++    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(DEVICE(s), 0));
++
++    /* 16550, 1-byte registers, 115200 base baud (1.8432 MHz clock) */
++    if (s->serial) {
++        Chardev *chr = qemu_chr_find(s->serial);
++
++        if (!chr) {
++            error_setg(errp, "chardev '%s' not found", s->serial);
++            return;
++        }
++        serial_mm_init(&s->bar0, 0x2000, 0, qdev_get_gpio_in(DEVICE(s), 2),
++                       115200, chr, DEVICE_LITTLE_ENDIAN);
++    }
++
++    /* GEM, bus mastering through the PCIe endpoint */
++    dev = qdev_new(TYPE_CADENCE_GEM);
++    if (s->netdev &&
++        !object_property_set_str(OBJECT(dev), "netdev", s->netdev, errp)) {
++        return;
++    }
++    object_property_set_link(OBJECT(dev), "dma",
++                             OBJECT(&pdev->bus_master_container_region),
++                             &error_abort);
++    sbd = SYS_BUS_DEVICE(dev);
++    if (!sysbus_realize_and_unref(sbd, errp)) {
++        return;
++    }
++    memory_region_add_subregion(&s->bar2, 0x0,
++                                sysbus_mmio_get_region(sbd, 0));
++    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(DEVICE(s), 1));
++
++    pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar0);
++    pci_register_bar(pdev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar2);
++}
++
++static void fpga_ep_exit(PCIDevice *pdev)
++{
++    msi_uninit(pdev);
++}
++
++static void fpga_ep_reset(DeviceState *dev)
++{
++    FpgaEpState *s = FPGA_EP(dev);
++
++    s->type = 0;
++    s->polarity = 0;
++    s->enable = 0;
++    s->status = 0;
++    fpga_ep_latch(s, fpga_ep_active(s));
++    s->asserted = false;
++}
++
++static Property fpga_ep_properties[] = {
++    DEFINE_PROP_STRING("chardev", FpgaEpState, chardev),
++    DEFINE_PROP_STRING("serial", FpgaEpState, serial),
++    DEFINE_PROP_STRING("netdev", FpgaEpState, netdev),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void fpga_ep_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
++
++    k->realize = fpga_ep_realize;
++    k->exit = fpga_ep_exit;
++    k->vendor_id = 0x1172;	/* Altera */
++    k->device_id = 0xe001;
++    k->class_id = PCI_CLASS_OTHERS;
++    dc->reset = fpga_ep_reset;
++    device_class_set_props(dc, fpga_ep_properties);
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++}
++
++static const TypeInfo fpga_ep_info = {
++    .name          = TYPE_FPGA_EP,
++    .parent        = TYPE_PCI_DEVICE,
++    .instance_size = sizeof(FpgaEpState),
++    .class_init    = fpga_ep_class_init,
++    .interfaces = (InterfaceInfo[]) {
++        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
++        { },
++    },
++};
++
++static void fpga_ep_register_types(void)
++{
++    type_register_static(&fpga_ep_info);
++}
++
++type_init(fpga_ep_register_types)

@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: GPL-2.0
+/* Spliced into the pcie@10000000 node of the QEMU virt DT by run.sh */
+		/* edu: stands in for the FPGA with the IRQ splitter */
+		fpga@2,0 {
+			reg = <0x1000 0 0 0 0>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			#address-cells = <2>;
+			#size-cells = <1>;
+
+			uio@0,0 {
+				compatible = "generic-uio";
+				reg = <0 0x0 0x20>;
+				interrupts = <3 4>;		/* level high */
+			};
+
+			uio@0,10000 {
+				compatible = "generic-uio";
+				reg = <0 0x10000 0x100>;
+				interrupts = <5 1>;		/* edge rising */
+			};
+
+			uio@0,20000 {
+				compatible = "generic-uio";
+				reg = <0 0x20000 0x100>;
+				status = "disabled";
+			};
+
+			uio@3,0 {				/* BAR3 does not exist */
+				compatible = "generic-uio";
+				reg = <3 0x0 0x10>;
+			};
+		};
+
+		/* ivshmem-plain: BAR2 is host shared memory, 64-bit prefetchable */
+		fpga@3,0 {
+			reg = <0x1800 0 0 0 0>;
+			#address-cells = <2>;
+			#size-cells = <1>;
+
+			gpio@2,0 {
+				compatible = "brcm,bcm6345-gpio";
+				reg = <2 0x0 4>, <2 0x4 4>;
+				reg-names = "dirout", "dat";
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+
+			gpio@2,100 {
+				compatible = "brcm,bcm6345-gpio";
+				reg = <2 0x100 4>, <2 0x104 4>;
+				reg-names = "dirout", "dat";
+				gpio-controller;
+				#gpio-cells = <2>;
+				status = "disabled";
+			};
+		};
