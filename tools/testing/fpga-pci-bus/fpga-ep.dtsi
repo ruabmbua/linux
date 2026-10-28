@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Spliced into the pcie@10000000 node of the QEMU virt DT by
+ * run-fpga-ep.sh, for the fpga-ep device of qemu-fpga-ep.diff at 00:04.0.
+ */
+		fpga@4,0 {
+			compatible = "pci1172,e001";
+			reg = <0x2000 0 0 0 0>;
+			#address-cells = <2>;
+			#size-cells = <1>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+
+			serial@0,1000 {
+				compatible = "xlnx,xps-uartlite-1.00.a";
+				reg = <0 0x1000 0x10>;
+				interrupts = <0 1>;		/* pulse */
+				clocks = <&fpga_clk>;
+				clock-names = "s_axi_aclk";
+				current-speed = <115200>;
+			};
+
+			/* 8250_of maps it with of_address_to_resource() */
+			serial@0,2000 {
+				compatible = "ns16550a";
+				reg = <0 0x2000 0x100>;
+				interrupts = <2 4>;
+				clock-frequency = <1843200>;
+				reg-shift = <0>;
+				reg-io-width = <1>;
+			};
+
+			ethernet@2,0 {
+				compatible = "cdns,gem";
+				reg = <2 0x0 0x800>;
+				interrupts = <1 4>;
+				clocks = <&fpga_clk>, <&fpga_clk>;
+				clock-names = "pclk", "hclk";
+				phy-mode = "rgmii-id";
+			};
+		};
