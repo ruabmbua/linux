@@ -711,7 +711,28 @@ static int __maybe_unused fpb_resume(struct device *dev)
 
 static SIMPLE_DEV_PM_OPS(fpb_pm_ops, NULL, fpb_resume);
 
+/*
+ * TEST ONLY: QEMU "edu" device. Its IRQ status (0x24) and ack (0x64)
+ * registers behave like the splitter; it has no enable, type or polarity
+ * registers, so offsets that edu ignores are used for them.
+ */
+static const struct fpb_info fpb_qemu_edu_info = {
+	.irq_bar	= 0,
+	.irq_offset	= 0x20,
+	.irq_status	= 0x04,
+	.irq_enable	= 0x08,
+	.irq_clear	= 0x44,
+	.irq_type	= 0x0c,		/* ignored by edu */
+	.irq_polarity	= 0x10,		/* ignored by edu */
+	.nr_irqs	= 32,
+};
+
 static const struct pci_device_id fpb_pci_ids[] = {
+	/* TEST ONLY: QEMU edu and ivshmem-plain */
+	{ PCI_DEVICE(0x1234, 0x11e8),
+	  .driver_data = (kernel_ulong_t)&fpb_qemu_edu_info },
+	{ PCI_DEVICE(0x1af4, 0x1110),
+	  .driver_data = (kernel_ulong_t)&fpb_default_info },
 	/* Replace with the IDs of the actual FPGA design */
 	{ PCI_DEVICE(PCI_VENDOR_ID_ALTERA, 0xe001),
 	  .driver_data = (kernel_ulong_t)&fpb_default_info },
