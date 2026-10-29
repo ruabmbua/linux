@@ -11,6 +11,11 @@
 #   make O=$OUT ARCH=arm64 allnoconfig \
 #        KCONFIG_ALLCONFIG=tools/testing/fpga-pci-bus/qemu.config
 #   make O=$OUT ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image modules
+#
+# Environment:
+#   MODULE=<path>/fpga-pci-bus.ko  test this module instead of the one in
+#                                  the kbuild output dir, e.g. one built
+#                                  with out-of-tree/Makefile
 set -e
 
 OUT=$(realpath "$1")
@@ -50,7 +55,7 @@ for a in sh mount insmod rmmod cat grep echo dmesg devmem dd hexdump ls \
 	ln -s busybox "$R/bin/$a"
 done
 cp "$HERE/init.sh" "$R/init"
-cp "$OUT/drivers/bus/fpga-pci-bus.ko" "$R/lib/modules/"
+cp "${MODULE:-$OUT/drivers/bus/fpga-pci-bus.ko}" "$R/lib/modules/fpga-pci-bus.ko"
 (cd "$R" && find . | cpio -o -H newc --quiet) > "$WORK/initramfs.cpio"
 
 qemu-system-aarch64 "${QEMU_ARGS[@]}" -kernel "$OUT/arch/arm64/boot/Image" \

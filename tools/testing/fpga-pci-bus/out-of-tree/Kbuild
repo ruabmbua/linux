@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0
+
+# The kernel configuration is not read when cleaning
+ifdef CONFIG_MODULES
+ifneq ($(CONFIG_PCI)$(CONFIG_OF_IRQ),yy)
+$(error fpga-pci-bus needs a kernel with CONFIG_PCI and CONFIG_OF_IRQ)
+endif
+ifeq ($(CONFIG_FPGA_PCI_BUS),y)
+$(error the kernel has fpga-pci-bus built in, disable CONFIG_FPGA_PCI_BUS)
+endif
+ifeq ($(CONFIG_FPGA_PCI_BUS),m)
+$(warning the kernel also builds fpga-pci-bus as a module, disable CONFIG_FPGA_PCI_BUS)
+endif
+endif
+
+obj-m := fpga-pci-bus.o
