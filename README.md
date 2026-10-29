@@ -35,6 +35,8 @@ Both carry the same commits, in this order:
 7. `tools/testing: add QEMU tests for fpga-pci-bus`:
    [tools/testing/fpga-pci-bus/](tools/testing/fpga-pci-bus/)
 8. This README.
+9. `tools/testing: build fpga-pci-bus as an external module`: see
+   "Building out of tree".
 
 > The code was written with an AI assistant (Claude Code). It has no
 > `Signed-off-by:`. Whoever takes it over has to review it and certify the
@@ -325,7 +327,40 @@ Most platform drivers work unchanged. Check these points:
 - **Affinity:** child IRQs follow the single MSI and cannot be moved
   individually (no `irq_set_affinity`). Move the MSI's affinity instead.
 
-### 4. Bring-up checklist
+### 4. Building out of tree
+
+The driver also builds as an external module, so it can be shipped
+separately from the kernel. The kernel must still carry the three `of:`
+commits above. Without the two exports, modpost fails with
+`"of_irq_count" undefined!` / `"of_add_property" undefined!`. Without the
+flags-cell fix, the module builds and loads, but refuses to probe behind a
+bridge with `ranges;`.
+
+[tools/testing/fpga-pci-bus/out-of-tree/](tools/testing/fpga-pci-bus/out-of-tree/)
+holds a `Kbuild` and a `Makefile`. Its `fpga-pci-bus.c` is a symlink to
+the in-tree source, so both builds always use the same code:
+
+```sh
+cp -rL tools/testing/fpga-pci-bus/out-of-tree ~/fpga-pci-bus   # or build in place
+make -C ~/fpga-pci-bus KDIR=$OUT ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+make -C ~/fpga-pci-bus KDIR=$OUT ARCH=arm64 INSTALL_MOD_PATH=<rootfs> modules_install
+```
+
+- `KDIR` is the kernel build directory (`O=`), and defaults to
+  `/lib/modules/$(uname -r)/build`.
+- `modules_install` puts the module in `lib/modules/<release>/extra/` and
+  runs `depmod`, so the PCI modalias still autoloads it.
+- The kernel needs `CONFIG_PCI`, `CONFIG_OF_IRQ` and `CONFIG_MODULES`.
+- Leave `CONFIG_FPGA_PCI_BUS` off in the kernel. The build stops if it is
+  `y`, because the built-in driver would claim the device and the module's
+  `pci_register_driver()` would fail. It warns if it is `m`, because two
+  modules of the same name would then be installed.
+- Loading the module taints the kernel with `O`, as any external module
+  does (`fpga_pci_bus: loading out-of-tree module taints kernel.`).
+- The QEMU test device IDs are part of the source. Leave the "DO NOT MERGE"
+  commit out of the copy you ship, as with the in-tree driver.
+
+### 5. Bring-up checklist
 
 ```sh
 lspci -nn                            # IDs match fpb_pci_ids[]
@@ -341,7 +376,7 @@ cat /sys/kernel/debug/irq/domains/*fpga*  # with CONFIG_GENERIC_IRQ_DEBUGFS
 The child devices are under `/sys/bus/pci/devices/<bdf>/`, named
 `<address>.<node>`.
 
-### 5. PREEMPT_RT
+### 6. PREEMPT_RT
 
 The `-rt` branch carries the same code; no changes were needed:
 
@@ -354,7 +389,7 @@ The `-rt` branch carries the same code; no changes were needed:
 One caveat: in the INTx fallback, the `IRQF_SHARED | IRQF_NO_THREAD` handler
 cannot share its line with a force-threaded handler. MSI is not affected.
 
-### 6. Threaded child handlers and their priorities
+### 7. Threaded child handlers and their priorities
 
 Each child interrupt is a separate Linux IRQ, so it gets its own IRQ
 thread like any other interrupt. Nothing in the child driver or the DT has
@@ -430,6 +465,11 @@ make O=$OUT ARCH=arm64 allnoconfig \
      KCONFIG_ALLCONFIG=tools/testing/fpga-pci-bus/qemu.config     # qemu-rt.config on -rt
 make O=$OUT ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules
 ```
+
+To test the out-of-tree build instead, remove `CONFIG_FPGA_PCI_BUS=m` from
+the configuration fragment, build the module as in "Building out of tree",
+and pass it to any of the tests below with
+`MODULE=/path/to/fpga-pci-bus.ko`.
 
 ### Test 1: stock QEMU (`run.sh`)
 

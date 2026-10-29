@@ -17,6 +17,7 @@
 #   SMP=1                    number of CPUs (default 2)
 #   APPEND=threadirqs        extra kernel command line
 #   ROOTPORT=1               put the FPGA behind a PCIe root port
+#   MODULE=<path>/fpga-pci-bus.ko  test an out-of-tree build, see run.sh
 set -e
 
 QEMU=$(realpath "$1")
@@ -85,7 +86,7 @@ done
 cp "$HERE/$INIT" "$R/init"
 "${CROSS_COMPILE:-aarch64-linux-gnu-}gcc" -static -O2 -o "$R/bin/rtprio" \
 	"$HERE/rtprio.c"
-cp "$OUT/drivers/bus/fpga-pci-bus.ko" "$R/lib/modules/"
+cp "${MODULE:-$OUT/drivers/bus/fpga-pci-bus.ko}" "$R/lib/modules/fpga-pci-bus.ko"
 (cd "$R" && find . | cpio -o -H newc --quiet) > "$WORK/initramfs.cpio"
 
 cat "$WORK/ul.out" > "$WORK/ul.txt" &
