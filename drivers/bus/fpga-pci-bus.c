@@ -62,6 +62,11 @@
  *			as the input is active
  * @irq_polarity:	1 = active low / falling edge, 0 = active high / rising
  * @nr_irqs:		number of sources, at most 32
+ * @level_only:		the splitter has only STATUS and ENABLE: STATUS shows
+ *			the current level of its inputs, which are active high
+ *			level interrupts (e.g. Avalon interrupt senders) and
+ *			are cleared in the IP cores themselves. @irq_clear,
+ *			@irq_type and @irq_polarity are unused.
  *
  * The splitter is expected to raise the PCIe interrupt (send an MSI) on
  * every transition of (STATUS & ENABLE) from zero to non-zero.
@@ -75,6 +80,7 @@ struct fpb_info {
 	u32 irq_type;
 	u32 irq_polarity;
 	unsigned int nr_irqs;
+	bool level_only;
 };
 
 static const struct fpb_info fpb_default_info = {
@@ -94,6 +100,8 @@ struct fpga_pci_bus {
 
 	void __iomem *irq_base;
 	struct irq_domain *domain;
+	/* the vector is an INTx line shared with other devices */
+	bool shared;
 	/* protects the cached registers below and their hardware copies */
 	raw_spinlock_t lock;
 	u32 irq_enabled;
@@ -108,14 +116,19 @@ static void fpb_write_enable(struct fpga_pci_bus *fpb)
 
 static void fpb_write_config(struct fpga_pci_bus *fpb)
 {
-	writel(fpb->irq_edge, fpb->irq_base + fpb->info->irq_type);
-	writel(fpb->irq_low, fpb->irq_base + fpb->info->irq_polarity);
+	if (!fpb->info->level_only) {
+		writel(fpb->irq_edge, fpb->irq_base + fpb->info->irq_type);
+		writel(fpb->irq_low, fpb->irq_base + fpb->info->irq_polarity);
+	}
 	fpb_write_enable(fpb);
 }
 
 /* Size of the splitter register block */
 static u32 fpb_irq_regs_size(const struct fpb_info *info)
 {
+	if (info->level_only)
+		return max(info->irq_status, info->irq_enable) + 4;
+
 	return max(max3(info->irq_status, info->irq_enable, info->irq_clear),
 		   max(info->irq_type, info->irq_polarity)) + 4;
 }
@@ -210,11 +223,32 @@ static struct irq_chip fpb_irq_chip = {
 	.flags		= IRQCHIP_SKIP_SET_WAKE,
 };
 
+/*
+ * Level only splitter: nothing to configure and nothing to acknowledge,
+ * the input drops once the IP core's driver has cleared the cause.
+ */
+static int fpb_level_irq_set_type(struct irq_data *d, unsigned int type)
+{
+	return (type & IRQ_TYPE_SENSE_MASK) == IRQ_TYPE_LEVEL_HIGH ? 0 : -EINVAL;
+}
+
+static struct irq_chip fpb_level_irq_chip = {
+	.name		= "fpga-pci-bus",
+	.irq_mask	= fpb_irq_mask,
+	.irq_unmask	= fpb_irq_unmask,
+	.irq_set_type	= fpb_level_irq_set_type,
+	.flags		= IRQCHIP_SKIP_SET_WAKE,
+};
+
 static int fpb_irq_domain_map(struct irq_domain *d, unsigned int virq,
 			      irq_hw_number_t hwirq)
 {
-	irq_set_chip_data(virq, d->host_data);
-	irq_set_chip_and_handler(virq, &fpb_irq_chip, handle_level_irq);
+	struct fpga_pci_bus *fpb = d->host_data;
+
+	irq_set_chip_data(virq, fpb);
+	irq_set_chip_and_handler(virq, fpb->info->level_only ?
+				 &fpb_level_irq_chip : &fpb_irq_chip,
+				 handle_level_irq);
 	irq_set_noprobe(virq);
 
 	return 0;
@@ -229,7 +263,7 @@ static irqreturn_t fpb_irq_demux(int irq, void *data)
 {
 	struct fpga_pci_bus *fpb = data;
 	irqreturn_t ret = IRQ_NONE;
-	unsigned long pending;
+	unsigned long pending, flags;
 	unsigned int loops, bit;
 	u32 status;
 
@@ -237,11 +271,11 @@ static irqreturn_t fpb_irq_demux(int irq, void *data)
 		status = readl(fpb->irq_base + fpb->info->irq_status);
 		/* All ones: the device is gone (surprise removal, link down) */
 		if (status == U32_MAX)
-			return ret;
+			goto out;
 
 		pending = status & READ_ONCE(fpb->irq_enabled);
 		if (!pending)
-			return ret;
+			goto out;
 
 		for_each_set_bit(bit, &pending, fpb->info->nr_irqs)
 			generic_handle_irq(irq_find_mapping(fpb->domain, bit));
@@ -250,7 +284,24 @@ static irqreturn_t fpb_irq_demux(int irq, void *data)
 
 	dev_warn_ratelimited(&fpb->pdev->dev,
 			     "interrupts still pending: %#lx\n", pending);
-	return ret;
+
+	/*
+	 * (STATUS & ENABLE) stays non-zero, so the splitter will not send
+	 * another MSI on its own: let it see a new zero to non-zero edge.
+	 */
+	raw_spin_lock_irqsave(&fpb->lock, flags);
+	writel(0, fpb->irq_base + fpb->info->irq_enable);
+	fpb_write_enable(fpb);
+	raw_spin_unlock_irqrestore(&fpb->lock, flags);
+
+out:
+	/*
+	 * An MSI that was sent while the loop above was still running finds
+	 * nothing left to do. That is expected and must not be counted as
+	 * spurious, or the kernel eventually disables the vector. Only a
+	 * shared INTx line needs an honest answer.
+	 */
+	return fpb->shared ? ret : IRQ_HANDLED;
 }
 
 static void fpb_irq_domain_remove(void *data)
@@ -315,7 +366,9 @@ static int fpb_irq_init(struct fpga_pci_bus *fpb)
 	fpb->irq_edge = 0;
 	fpb->irq_low = 0;
 	fpb_write_config(fpb);
-	writel(GENMASK(info->nr_irqs - 1, 0), fpb->irq_base + info->irq_clear);
+	if (!info->level_only)
+		writel(GENMASK(info->nr_irqs - 1, 0),
+		       fpb->irq_base + info->irq_clear);
 
 	fpb->domain = irq_domain_add_linear(dev->of_node, info->nr_irqs,
 					    &fpb_irq_domain_ops, fpb);
@@ -336,7 +389,8 @@ static int fpb_irq_init(struct fpga_pci_bus *fpb)
 
 	/* The demux handler must run in hard IRQ context */
 	irqflags = IRQF_NO_THREAD;
-	if (!pdev->msi_enabled && !pdev->msix_enabled)
+	fpb->shared = !pdev->msi_enabled && !pdev->msix_enabled;
+	if (fpb->shared)
 		irqflags |= IRQF_SHARED;
 
 	return devm_request_irq(dev, pci_irq_vector(pdev, 0), fpb_irq_demux,
